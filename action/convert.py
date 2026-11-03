@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import uuid
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -416,15 +417,42 @@ def _files_to_convert(recipe_glob: str, recipe_files_json: str | None = None) ->
     return sorted(Path(name) for name in glob.glob(recipe_glob, recursive=True) if Path(name).is_file())
 
 
+def _write_action_outputs(output: Path, success: bool, report: str, converted_files: list[Path] | None = None) -> None:
+    output_file = os.environ.get('GITHUB_OUTPUT')
+    if not output_file:
+        return
+    delimiter = f'validation_report_{uuid.uuid4().hex}'
+    with open(output_file, 'a', encoding='utf-8') as handle:
+        handle.write(f'output-directory={output.as_posix()}\n')
+        handle.write(f'validation-success={str(success).lower()}\n')
+        handle.write(f'converted-json-files={json.dumps([path.as_posix() for path in (converted_files or [])])}\n')
+        handle.write(f'validation-report<<{delimiter}\n{report}\n{delimiter}\n')
+
+
 def main() -> int:
     recipe_glob = os.environ.get('RECIPE_GLOB', 'recipes/**/*.md')
-    files = _files_to_convert(recipe_glob, os.environ.get('RECIPE_FILES_JSON'))
-    if not files:
-        print(f'No recipe files matched {recipe_glob!r}', file=sys.stderr)
-        return 1
     output = Path(os.environ.get('OUTPUT_DIR', 'build/recipes'))
-    output.mkdir(parents=True, exist_ok=True)
+    try:
+        files = _files_to_convert(recipe_glob, os.environ.get('RECIPE_FILES_JSON'))
+    except (OSError, RuntimeError, ValueError, TypeError) as exc:
+        print(exc, file=sys.stderr)
+        _write_action_outputs(output, False, str(exc))
+        return 1
+    if not files:
+        message = f'No recipe files matched {recipe_glob!r}'
+        print(message, file=sys.stderr)
+        _write_action_outputs(output, False, message)
+        return 1
+    try:
+        output.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        message = f'Cannot create conversion output directory {output}: {exc}'
+        print(message, file=sys.stderr)
+        _write_action_outputs(output, False, message)
+        return 1
     failed = False
+    failures = []
+    converted_files = []
     for path in files:
         try:
             payload, recipe_id, thumbnail_path, details_image_path = parse_recipe(path)
@@ -432,6 +460,7 @@ def main() -> int:
                 thumbnail_path = _create_thumbnail(thumbnail_path, output / f'{path.stem}.thumbnail.jpg')
             target = output / f'{path.stem}.json'
             target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+            converted_files.append(target)
             id_path = target.with_suffix('.id')
             source_path = target.with_suffix('.source')
             source_path.write_text(f'{path.resolve()}\n', encoding='utf-8')
@@ -448,11 +477,11 @@ def main() -> int:
             print(f'Converted {path} -> {target}')
         except (OSError, RuntimeError, ValueError, TypeError) as exc:
             failed = True
-            print(f'{path}: {exc}', file=sys.stderr)
-    output_file = os.environ.get('GITHUB_OUTPUT')
-    if output_file:
-        with open(output_file, 'a', encoding='utf-8') as handle:
-            handle.write(f'output-directory={output.as_posix()}\n')
+            message = f'{path}: {exc}'
+            failures.append(message)
+            print(message, file=sys.stderr)
+    report = '\n'.join(failures) if failures else f'Converted {len(files)} recipe(s) successfully.'
+    _write_action_outputs(output, not failed, report, converted_files)
     return int(failed)
 
 
