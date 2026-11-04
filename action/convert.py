@@ -6,11 +6,13 @@ import json
 import os
 import re
 import sys
+import uuid
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from action.mode_markdown import parse_mode
 from monsieur_cuisine_cli.api.recipe_validation import (
     canonical_locale,
     resolve_markdown_option,
@@ -26,6 +28,7 @@ _METADATA_FIELDS = {
     'devicetypeids',
     'servings',
     'recipeid',
+    'originalrecipeid',
     'ingredientgroupname',
     'preparationtime',
     'readyintime',
@@ -36,6 +39,12 @@ _METADATA_FIELDS = {
     'thumbnail',
     'detailsimage',
 }
+
+_AMOUNT_NUMBER = r'(?:\d+(?:[.,]\d+)?(?:\s*/\s*\d+(?:[.,]\d+)?)?|[¼½¾⅐⅓⅔⅛⅜⅝⅞])'
+_AMOUNT_PATTERN = re.compile(
+    rf'^(?:ca\.?\s*)?{_AMOUNT_NUMBER}(?:\s+\d+\s*/\s*\d+)?(?:\s*[-–]\s*{_AMOUNT_NUMBER})?$',
+    re.IGNORECASE,
+)
 
 
 def parse_recipe(path: Path) -> tuple[dict, int | None, Path | None, Path | None]:
@@ -133,29 +142,52 @@ def parse_recipe(path: Path) -> tuple[dict, int | None, Path | None, Path | None
     for line in section_lines('ingredients'):
         item = re.sub(r'^[-*+]\s+', '', line)
         annotation = re.search(r'<!--\s*mc-ingredient:\s*(\{.*\})\s*-->', item)
-        details = json.loads(annotation.group(1)) if annotation else {}
         if annotation:
+            # Continue accepting the previous hidden representation so
+            # existing cookbook files remain valid; new output is plain text.
+            details = json.loads(annotation.group(1))
             item = item[: annotation.start()].strip()
-        if not isinstance(details, dict):
-            raise ValueError('mc-ingredient annotation must be a JSON object')
-        unit = details.get('unit', '')
-        if unit:
-            unit = resolve_markdown_option('ingredient_unit', str(unit), locale)['unit_name']
-        ingredients.append(
-            {
-                'name': item,
-                'amount': details.get('amount', ''),
-                'unit': unit,
-                'isOptional': details.get('isOptional', False),
-            }
-        )
+            if not isinstance(details, dict):
+                raise ValueError('mc-ingredient annotation must be a JSON object')
+            amount = str(details.get('amount') or '')
+            unit_value = str(details.get('unit') or '')
+            unit = resolve_markdown_option('ingredient_unit', unit_value, locale)['unit_name'] if unit_value else ''
+            is_optional = details.get('isOptional', False)
+            if not isinstance(is_optional, bool):
+                raise ValueError('mc-ingredient isOptional must be a boolean')
+        else:
+            item, amount, unit, is_optional = _parse_ingredient_text(item, locale)
+        ingredients.append({'name': item, 'amount': amount, 'unit': unit, 'isOptional': is_optional})
     steps = []
-    for line in section_lines('steps'):
+    step_lines = section_lines('steps')
+    index = 0
+    while index < len(step_lines):
+        line = step_lines[index]
+        index += 1
         item = re.sub(r'^\d+[.)]\s+', '', line)
         annotation = re.search(r'<!--\s*mc-mode:\s*(\{.*\})\s*-->', item)
         mode = json.loads(annotation.group(1)) if annotation else None
         if annotation:
             item = item[: annotation.start()].strip()
+        if index < len(step_lines) and re.match(r'^\*\*(?:Mode|Modo):\*\*', step_lines[index].strip(), re.IGNORECASE):
+            try:
+                mode = parse_mode(step_lines[index].strip(), locale)
+            except ValueError as exc:
+                raise ValueError(f'invalid device mode on step {len(steps) + 1}: {exc}') from exc
+            index += 1
+        elif index < len(step_lines) and step_lines[index].strip().casefold() in {'```json', '```'}:
+            index += 1
+            mode_lines = []
+            while index < len(step_lines) and step_lines[index].strip() != '```':
+                mode_lines.append(step_lines[index].strip())
+                index += 1
+            if index >= len(step_lines):
+                raise ValueError('device settings code block is missing its closing fence')
+            index += 1
+            try:
+                mode = json.loads('\n'.join(mode_lines))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f'device settings code block must contain valid JSON: {exc}') from exc
         title_match = re.match(r'^\*\*(.+?)\*\*:\s*(.*)$', item)
         step_title = title_match.group(1) if title_match else title
         step_description = title_match.group(2) if title_match else item
@@ -198,6 +230,11 @@ def parse_recipe(path: Path) -> tuple[dict, int | None, Path | None, Path | None
     recipe_id = metadata.get('recipeid')
     if recipe_id is not None and (not isinstance(recipe_id, int) or isinstance(recipe_id, bool) or recipe_id < 1):
         raise ValueError('recipeId must be a positive integer')
+    original_recipe_id = metadata.get('originalrecipeid')
+    if original_recipe_id is not None and (
+        not isinstance(original_recipe_id, int) or isinstance(original_recipe_id, bool) or original_recipe_id < 1
+    ):
+        raise ValueError('originalRecipeId must be a positive integer')
 
     ingredient_groups = [
         {
@@ -239,6 +276,41 @@ def parse_recipe(path: Path) -> tuple[dict, int | None, Path | None, Path | None
     except RuntimeError as exc:
         raise ValueError(str(exc)) from exc
     return payload, recipe_id, thumbnail_path, details_image_path
+
+
+def _parse_ingredient_text(item: str, locale: str) -> tuple[str, str, str, bool]:
+    """Parse ``name — amount unit (optional)`` ingredient lines."""
+    is_optional = bool(re.search(r'\s+\(optional\)$', item, re.IGNORECASE))
+    if is_optional:
+        item = re.sub(r'\s+\(optional\)$', '', item, flags=re.IGNORECASE).rstrip()
+
+    name, separator, details = item.rpartition(' — ')
+    if not separator:
+        if not item:
+            raise ValueError('ingredient name must not be empty')
+        return item, '', '', is_optional
+    name = name.strip()
+    details = details.strip()
+    if not name or not details:
+        raise ValueError('ingredients with an amount or unit must use "name — amount unit"')
+
+    words = details.split()
+    for start in range(len(words)):
+        unit_text = ' '.join(words[start:])
+        try:
+            unit = resolve_markdown_option('ingredient_unit', unit_text, locale)['unit_name']
+        except RuntimeError:
+            continue
+        amount = ' '.join(words[:start])
+        if amount and not _AMOUNT_PATTERN.fullmatch(amount):
+            continue
+        return name, amount, unit, is_optional
+
+    if _AMOUNT_PATTERN.fullmatch(details):
+        return name, details, '', is_optional
+    raise ValueError(
+        f'ingredient details {details!r} must contain an amount and/or an ingredient unit available for {locale}'
+    )
 
 
 def _table_rows(lines: list[str]) -> list[list[str]]:
@@ -334,7 +406,7 @@ def _parse_metadata_value(field: str, value: str, locale: str = 'en-US'):
             except (TypeError, ValueError):
                 result.append(resolve_markdown_option(option_field, str(item), locale)['id'])
         return result
-    if field in {'recipeid', 'preparationtime', 'readyintime'}:
+    if field in {'recipeid', 'originalrecipeid', 'preparationtime', 'readyintime'}:
         if field == 'recipeid':
             link = re.fullmatch(r'\[[^\]]+\]\((https?://[^)]+)\)', value)
             if link:
@@ -369,15 +441,42 @@ def _files_to_convert(recipe_glob: str, recipe_files_json: str | None = None) ->
     return sorted(Path(name) for name in glob.glob(recipe_glob, recursive=True) if Path(name).is_file())
 
 
+def _write_action_outputs(output: Path, success: bool, report: str, converted_files: list[Path] | None = None) -> None:
+    output_file = os.environ.get('GITHUB_OUTPUT')
+    if not output_file:
+        return
+    delimiter = f'validation_report_{uuid.uuid4().hex}'
+    with open(output_file, 'a', encoding='utf-8') as handle:
+        handle.write(f'output-directory={output.as_posix()}\n')
+        handle.write(f'validation-success={str(success).lower()}\n')
+        handle.write(f'converted-json-files={json.dumps([path.as_posix() for path in (converted_files or [])])}\n')
+        handle.write(f'validation-report<<{delimiter}\n{report}\n{delimiter}\n')
+
+
 def main() -> int:
     recipe_glob = os.environ.get('RECIPE_GLOB', 'recipes/**/*.md')
-    files = _files_to_convert(recipe_glob, os.environ.get('RECIPE_FILES_JSON'))
-    if not files:
-        print(f'No recipe files matched {recipe_glob!r}', file=sys.stderr)
-        return 1
     output = Path(os.environ.get('OUTPUT_DIR', 'build/recipes'))
-    output.mkdir(parents=True, exist_ok=True)
+    try:
+        files = _files_to_convert(recipe_glob, os.environ.get('RECIPE_FILES_JSON'))
+    except (OSError, RuntimeError, ValueError, TypeError) as exc:
+        print(exc, file=sys.stderr)
+        _write_action_outputs(output, False, str(exc))
+        return 1
+    if not files:
+        message = f'No recipe files matched {recipe_glob!r}'
+        print(message, file=sys.stderr)
+        _write_action_outputs(output, False, message)
+        return 1
+    try:
+        output.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        message = f'Cannot create conversion output directory {output}: {exc}'
+        print(message, file=sys.stderr)
+        _write_action_outputs(output, False, message)
+        return 1
     failed = False
+    failures = []
+    converted_files = []
     for path in files:
         try:
             payload, recipe_id, thumbnail_path, details_image_path = parse_recipe(path)
@@ -385,6 +484,7 @@ def main() -> int:
                 thumbnail_path = _create_thumbnail(thumbnail_path, output / f'{path.stem}.thumbnail.jpg')
             target = output / f'{path.stem}.json'
             target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+            converted_files.append(target)
             id_path = target.with_suffix('.id')
             source_path = target.with_suffix('.source')
             source_path.write_text(f'{path.resolve()}\n', encoding='utf-8')
@@ -401,11 +501,11 @@ def main() -> int:
             print(f'Converted {path} -> {target}')
         except (OSError, RuntimeError, ValueError, TypeError) as exc:
             failed = True
-            print(f'{path}: {exc}', file=sys.stderr)
-    output_file = os.environ.get('GITHUB_OUTPUT')
-    if output_file:
-        with open(output_file, 'a', encoding='utf-8') as handle:
-            handle.write(f'output-directory={output.as_posix()}\n')
+            message = f'{path}: {exc}'
+            failures.append(message)
+            print(message, file=sys.stderr)
+    report = '\n'.join(failures) if failures else f'Converted {len(files)} recipe(s) successfully.'
+    _write_action_outputs(output, not failed, report, converted_files)
     return int(failed)
 
 
