@@ -8,7 +8,10 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-from action.mode_markdown import render_mode
+try:
+    from .mode_markdown import render_mode
+except ImportError:  # The action entry point imports this file as a top-level module.
+    from mode_markdown import render_mode
 
 
 def _markdown(value: object) -> str:
@@ -213,7 +216,14 @@ def write_markdown_file(
     if is_owned is True:
         metadata.append(('recipeId', recipe_id))
     elif is_owned is False:
-        metadata.append(('originalRecipeId', recipe_id))
+        source_url = requested_recipe.strip()
+        parsed_source_url = urlsplit(source_url)
+        original_id = str(recipe_id)
+        if parsed_source_url.scheme == 'https' and parsed_source_url.netloc:
+            # Keep the ID as the visible label while linking back to the public
+            # recipe page used for this import.
+            original_id = f'[{original_id}]({source_url})'
+        metadata.append(('originalRecipeId', original_id))
     elif re.fullmatch(r'[1-9][0-9]*', requested_recipe.strip()):
         # Preserve the old behavior for direct callers that do not perform an
         # ownership check. The get action always supplies the checked result.
